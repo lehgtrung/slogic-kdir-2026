@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.venv/
+venv/
+
+data/
+sub_graphs/
+locally_applicable_metapaths/
+experiments/
+
+*.pt
+*.pkl
+*.log

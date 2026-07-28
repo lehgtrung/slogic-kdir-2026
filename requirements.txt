@@ -1,0 +1,9 @@
+natsort
+networkx
+numpy
+pandas
+rustworkx
+scipy
+torch
+torch-geometric
+tqdm

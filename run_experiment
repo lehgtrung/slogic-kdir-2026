@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "Usage: bash run_experiment <dataset> <samples|full> [seed]"
+  echo "Example: bash run_experiment wn18rr 50000"
+  exit 1
+fi
+
+DATASET="$1"
+SAMPLES="$2"
+SEED="${3:-1024}"
+
+CORES="${CORES:-32}"
+WORKERS="${WORKERS:-8}"
+NEIGHBORS="${NEIGHBORS:-100}"
+KPOS="${KPOS:-5}"
+KNEG="${KNEG:-20}"
+EPOCHS="${EPOCHS:-15}"
+DROPOUT="${DROPOUT:-0.5}"
+LR="${LR:-0.001}"
+DEVICE="${DEVICE:-cuda}"
+EXTRACT_SUBGRAPHS="${EXTRACT_SUBGRAPHS:-0}"
+
+case "$DATASET" in
+  wn18rr)
+    HOPS="${HOPS:-4}"
+    RULE_HOPS="${RULE_HOPS:-6}"
+    BATCH_SIZE="${BATCH_SIZE:-256}"
+    EVAL_NUM_RULES="${EVAL_NUM_RULES:-50}"
+    LOCAL_NUM_RULES="${LOCAL_NUM_RULES:-100}"
+    ;;
+  FB15k-237)
+    HOPS="${HOPS:-1}"
+    RULE_HOPS="${RULE_HOPS:-4}"
+    BATCH_SIZE="${BATCH_SIZE:-10240}"
+    EVAL_NUM_RULES="${EVAL_NUM_RULES:-50}"
+    LOCAL_NUM_RULES="${LOCAL_NUM_RULES:-100}"
+    ;;
+  yago3-10)
+    HOPS="${HOPS:-1}"
+    RULE_HOPS="${RULE_HOPS:-4}"
+    BATCH_SIZE="${BATCH_SIZE:-10240}"
+    EVAL_NUM_RULES="${EVAL_NUM_RULES:-10}"
+    LOCAL_NUM_RULES="${LOCAL_NUM_RULES:-100}"
+    ;;
+  nations)
+    HOPS="${HOPS:-2}"
+    RULE_HOPS="${RULE_HOPS:-2}"
+    BATCH_SIZE="${BATCH_SIZE:-256}"
+    EVAL_NUM_RULES="${EVAL_NUM_RULES:-50}"
+    LOCAL_NUM_RULES="${LOCAL_NUM_RULES:-100}"
+    ;;
+  *)
+    echo "Unknown dataset: $DATASET"
+    echo "Set HOPS, RULE_HOPS, BATCH_SIZE, EVAL_NUM_RULES manually or add the dataset to run_experiment."
+    exit 1
+    ;;
+esac
+
+if [[ "$SAMPLES" == "full" ]]; then
+  SAMPLE_LABEL="full"
+  SAMPLE_ARGS=()
+else
+  SAMPLE_LABEL="samples_${SAMPLES}"
+  SAMPLE_ARGS=(--samples "$SAMPLES")
+fi
+
+RUN_DIR="data/${DATASET}/experiments/${SAMPLE_LABEL}"
+SUBGRAPH_DIR="sub_graphs/${DATASET}_${HOPS}_${NEIGHBORS}_head_centric"
+EXP_DIR="experiments/${DATASET}/${SAMPLE_LABEL}_seed_${SEED}"
+LOG_FILE="${RUN_DIR}/run_${SAMPLE_LABEL}_seed_${SEED}.log"
+METADATA_FILE="${RUN_DIR}/metadata_${SAMPLE_LABEL}_seed_${SEED}.tsv"
+RESULT_FILE="${RUN_DIR}/result_${SAMPLE_LABEL}_seed_${SEED}.txt"
+
+RULE_PATH="${RUN_DIR}/rules_${SAMPLES}.tsv"
+POS_RULE_PATH="${RUN_DIR}/train_pos_rules_${SAMPLES}.tsv"
+LOCAL_RULE_PATH="${RUN_DIR}/train_local_rules_${SAMPLES}.pkl"
+TRAINING_CSV="${RUN_DIR}/train_data_${SAMPLES}_kpos_${KPOS}_kneg_${KNEG}.tsv"
+VALID_CSV="${RUN_DIR}/valid_wilson_top_${EVAL_NUM_RULES}_${SAMPLES}.tsv"
+TEST_CSV="${RUN_DIR}/test_wilson_top_${EVAL_NUM_RULES}_${SAMPLES}.tsv"
+SCORED_TEST_CSV="${TEST_CSV%.tsv}_scored.tsv"
+
+mkdir -p "$RUN_DIR" "$EXP_DIR"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+trap 'echo "FAILED at line $LINENO. See log: $LOG_FILE" > "$RESULT_FILE"' ERR
+
+echo "Dataset: $DATASET"
+echo "Samples: $SAMPLES"
+echo "Run dir: $RUN_DIR"
+echo "Experiment dir: $EXP_DIR"
+
+cat > "$METADATA_FILE" <<EOF
+key	value
+dataset	${DATASET}
+samples	${SAMPLES}
+seed	${SEED}
+cores	${CORES}
+workers	${WORKERS}
+neighbors	${NEIGHBORS}
+hops	${HOPS}
+rule_hops	${RULE_HOPS}
+batch_size	${BATCH_SIZE}
+eval_num_rules	${EVAL_NUM_RULES}
+local_num_rules	${LOCAL_NUM_RULES}
+kpos	${KPOS}
+kneg	${KNEG}
+epochs	${EPOCHS}
+dropout	${DROPOUT}
+lr	${LR}
+device	${DEVICE}
+extract_subgraphs	${EXTRACT_SUBGRAPHS}
+run_dir	${RUN_DIR}
+experiment_dir	${EXP_DIR}
+subgraph_dir	${SUBGRAPH_DIR}
+rule_path	${RULE_PATH}
+pos_rule_path	${POS_RULE_PATH}
+local_rule_path	${LOCAL_RULE_PATH}
+training_csv	${TRAINING_CSV}
+valid_csv	${VALID_CSV}
+test_csv	${TEST_CSV}
+scored_test_csv	${SCORED_TEST_CSV}
+log_file	${LOG_FILE}
+result_file	${RESULT_FILE}
+EOF
+
+echo "Metadata: $METADATA_FILE"
+echo "Log: $LOG_FILE"
+cat > "$RESULT_FILE" <<EOF
+PENDING
+The run has started but final evaluation has not finished yet.
+Dataset: ${DATASET}
+Samples: ${SAMPLES}
+Seed: ${SEED}
+Log: ${LOG_FILE}
+EOF
+echo "Result file: $RESULT_FILE"
+
+echo
+echo "== Step 1: Extract sampled cyclic rules =="
+python extract_rules_multi_cores.py \
+  --dataset "$DATASET" \
+  --hops "$RULE_HOPS" \
+  --cores "$CORES" \
+  "${SAMPLE_ARGS[@]}" \
+  --output "$RULE_PATH" \
+  --output_pos "$POS_RULE_PATH"
+
+echo
+echo "== Step 2: Head-centric subgraphs =="
+if [[ "$EXTRACT_SUBGRAPHS" == "1" ]]; then
+  python subgraph_extraction.py \
+    --dataset "$DATASET" \
+    --hops "$HOPS" \
+    --neighbors "$NEIGHBORS" \
+    --workers "$WORKERS"
+else
+  echo "Skipping subgraph extraction. Expected existing directory: $SUBGRAPH_DIR"
+fi
+
+echo
+echo "== Step 3: Extract locally applicable rules =="
+python extract_local_applicable_rules_opt2.py \
+  --dataset "$DATASET" \
+  --rule_path "$RULE_PATH" \
+  --pos_rule_path "$POS_RULE_PATH" \
+  --output "$LOCAL_RULE_PATH" \
+  --num_rules "$LOCAL_NUM_RULES"
+
+echo
+echo "== Step 4: Build contrastive training data =="
+python extract_training_data_optimized.py \
+  --dataset "$DATASET" \
+  --rule_path "$RULE_PATH" \
+  --pos_rule_path "$POS_RULE_PATH" \
+  --local_rule_path "$LOCAL_RULE_PATH" \
+  --output "$TRAINING_CSV" \
+  --kpos "$KPOS" \
+  --kneg "$KNEG"
+
+echo
+echo "== Step 5: Train neural rule ranker =="
+python train_slogic_gru.py \
+  --dataset "$DATASET" \
+  --subgraph_dir "$SUBGRAPH_DIR" \
+  --training_csv "$TRAINING_CSV" \
+  --save_path "$EXP_DIR" \
+  --batch_size "$BATCH_SIZE" \
+  --epochs "$EPOCHS" \
+  --dropout "$DROPOUT" \
+  --lr "$LR" \
+  --device "$DEVICE" \
+  --seed "$SEED"
+
+echo
+echo "== Step 6: Build valid/test candidate rule tables =="
+python extract_test_data_optimized.py \
+  --dataset "$DATASET" \
+  --split valid \
+  --rule_path "$RULE_PATH" \
+  --output "$VALID_CSV" \
+  --num_rules "$EVAL_NUM_RULES"
+
+python extract_test_data_optimized.py \
+  --dataset "$DATASET" \
+  --split test \
+  --rule_path "$RULE_PATH" \
+  --output "$TEST_CSV" \
+  --num_rules "$EVAL_NUM_RULES"
+
+echo
+echo "== Step 7: Score test rules =="
+python infer_slogic_gru.py \
+  --dataset "$DATASET" \
+  --split test \
+  --test_file "$TEST_CSV" \
+  --model_path "${EXP_DIR}/saved_model_${EPOCHS}.pt"
+
+echo
+echo "== Step 8: Evaluate link prediction =="
+python run_score_parallel.py \
+  --dataset "$DATASET" \
+  --split test \
+  --scored_file "$SCORED_TEST_CSV" > "$RESULT_FILE"
+cat "$RESULT_FILE"
+
+echo
+echo "Done."
+echo "Rules: $RULE_PATH"
+echo "Positive rule instances: $POS_RULE_PATH"
+echo "Training data: $TRAINING_CSV"
+echo "Scored test file: $SCORED_TEST_CSV"
+echo "Result file: $RESULT_FILE"
+echo "Full log: $LOG_FILE"
+echo "Metadata: $METADATA_FILE"
